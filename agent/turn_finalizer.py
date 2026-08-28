@@ -57,11 +57,67 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 )
 
 
+def _extract_budget_telemetry(messages):
+    """Extract the per-card loop-signature fields for budget telemetry.
+
+    Returns ``(final_action, completion_tool_called, context_tail)``:
+
+    * ``final_action`` — the name of the last tool the model invoked
+      before the budget ran out. ``None`` when the transcript ends on a
+      bare assistant/user message with no pending tool call.
+    * ``completion_tool_called`` — True when ``kanban_complete`` or
+      ``kanban_block`` was ever invoked, regardless of position. Lets the
+      auditor distinguish "worker tried to finish but budget ran out"
+      from "worker never attempted completion".
+    * ``context_tail`` — the last 200 chars of the flattened transcript
+      text, as an approximate loop signature (users can inspect whether
+      the tail repeats the same tool call).
+
+    Best-effort and defensive: the transcript shape is not guaranteed at
+    this point (some exit paths persist scaffolding), so every access is
+    guarded and any failure degrades to benign defaults.
+    """
+    final_action = None
+    completion_tool_called = False
+    parts = []
+    try:
+        for m in reversed(messages or []):
+            if not isinstance(m, dict):
+                continue
+            if parts is not None and len(parts) < 20:
+                txt = flatten_message_text(m.get("content"))
+                if txt:
+                    parts.append(str(txt))
+            tcs = m.get("tool_calls")
+            if tcs and isinstance(tcs, list):
+                for tc in reversed(tcs):
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    name = (fn.get("name") if isinstance(fn, dict) else None) or ""
+                    if name:
+                        if final_action is None:
+                            final_action = name
+                        if name in {"kanban_complete", "kanban_block",
+                                    "kanban_request_review", "kanban_request_changes"}:
+                            completion_tool_called = True
+            if final_action and completion_tool_called and len(parts) >= 20:
+                break
+    except Exception:
+        return final_action, completion_tool_called, ""
+    tail = " ".join(reversed(parts))[:200]
+    return final_action, completion_tool_called, tail
+
+
 def _record_kanban_budget_exhausted(
     kanban_task: str,
     api_call_count: int,
     max_iterations: int,
     logger: logging.Logger,
+    *,
+    final_action: str | None = None,
+    completion_tool_called: bool = False,
+    context_tail: str = "",
 ) -> None:
     """Record a terminal ``timed_out`` outcome for a kanban worker that
     exhausted its iteration budget.
@@ -70,7 +126,23 @@ def _record_kanban_budget_exhausted(
     (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
     already closed the run this is a no-op — so it is safe to call from
     multiple exit paths.
+
+    The ``event_payload_extra`` carries per-card budget telemetry so
+    downstream audit (``hermes kanban log``, the dashboard, the nightly
+    telemetry digest) can distinguish a worker that looped without
+    converging from one doing genuine long-horizon work: ``turns_used``,
+    ``final_action`` (the last tool the model called), whether
+    ``kanban_complete`` was ever invoked, and the trailing context window
+    (last 200 chars of the flattened transcript) as a loop signature.
     """
+    payload_extra = {
+        "budget_used": api_call_count,
+        "budget_max": max_iterations,
+        "turns_used": api_call_count,
+        "final_action": final_action or None,
+        "completion_tool_called": bool(completion_tool_called),
+        "context_tail": (context_tail or "")[:200],
+    }
     try:
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
@@ -87,10 +159,7 @@ def _record_kanban_budget_exhausted(
                 outcome="timed_out",
                 release_claim=True,
                 end_run=True,
-                event_payload_extra={
-                    "budget_used": api_call_count,
-                    "budget_max": max_iterations,
-                },
+                event_payload_extra=payload_extra,
             )
         finally:
             try:
@@ -205,8 +274,12 @@ def finalize_turn(
         # consecutive-failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
+            _final_action, _comp_called, _ctx_tail = _extract_budget_telemetry(messages)
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
+                final_action=_final_action,
+                completion_tool_called=_comp_called,
+                context_tail=_ctx_tail,
             )
     elif budget_exhausted:
         # Bounded fallback (#87096): budget was exhausted but none of the

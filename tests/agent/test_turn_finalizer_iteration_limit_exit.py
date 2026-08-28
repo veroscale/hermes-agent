@@ -182,18 +182,26 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
     assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
-    record.assert_called_once_with(
-        conn,
-        "task-123",
-        error=(
-            "Iteration budget exhausted (60/60) — task could not complete "
-            "within the allowed iterations"
-        ),
-        outcome="timed_out",
-        release_claim=True,
-        end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+    record.assert_called_once()
+    _args, _kwargs = record.call_args
+    assert _args == (conn, "task-123")
+    assert _kwargs["error"] == (
+        "Iteration budget exhausted (60/60) — task could not complete "
+        "within the allowed iterations"
     )
+    assert _kwargs["outcome"] == "timed_out"
+    assert _kwargs["release_claim"] is True
+    assert _kwargs["end_run"] is True
+    _payload = _kwargs["event_payload_extra"]
+    assert _payload["budget_used"] == 60
+    assert _payload["budget_max"] == 60
+    # New per-card loop-signature telemetry (#t_8ab01085): turns used, the
+    # last tool the model called before exhausting the budget, whether a
+    # kanban completion tool was ever invoked, and the trailing context
+    # window (truncated to 200 chars) as a loop signature.
+    assert _payload["turns_used"] == 60
+    assert _payload["completion_tool_called"] is False
+    assert len(_payload["context_tail"]) <= 200
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
