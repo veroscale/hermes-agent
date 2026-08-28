@@ -68,6 +68,12 @@ class TestInterpretSignalExit:
 
     @pytest.mark.parametrize("code", [0, 1, 2, 42, 100, 127, 128])
     def test_normal_codes_return_none(self, code):
+        # 128 was promoted out of this set by t_0cea7247 — bash convention
+        # for "shell could not execute the command" (set -e abort, bad
+        # redirection, builtin error) now surfaces a hedged note instead of
+        # leaving the [frx] observer with a bare "exit 128".
+        if code == 128:
+            pytest.skip("128 is now surfaced — see test_exit_128_surfaces_hedged_note")
         assert _interpret_signal_exit(code) is None
 
 
@@ -93,3 +99,65 @@ class TestSignalExitWiring:
 
     def test_success_unchanged(self):
         assert _interpret_exit_code("ls", 0) is None
+
+
+class TestExit128Band:
+    """Regression for kanban t_0cea7247 — bare ``exit 128`` reaching the
+    [frx] observer with no human-readable note. Bash uses 128 (signum 0 in
+    the shell band) for "shell could not execute the command" — see
+    https://www.gnu.org/software/bash/manual/html_node/Exit-Status.html
+    and https://tldp.org/LDP/abs/html/exitcodes.html. Before the fix the
+    `_interpret_signal_exit` branch only fired for ``exit_code > 128`` and
+    the synthesis block at line ~3766 emitted a bare
+    ``Command exited 128 producing no output.`` to the model.
+    """
+
+    def test_exit_128_surfaces_hedged_note(self):
+        # The headline fix: exit_code == 128 must return a non-None note
+        # so the [frx] observer has something to forward and the model has
+        # something to read. Without this, the bare "exit 128" is the
+        # entire signal — exactly what the user reported.
+        note = _interpret_signal_exit(128)
+        assert note is not None
+        assert "128" in note
+        # Hedged: programs can legitimately ``exit 128`` themselves.
+        assert "usually" in note
+
+    def test_exit_128_does_not_call_it_a_signal(self):
+        # 128 is NOT a signal death (signum 0 means "no signal"). The fix
+        # explicitly does NOT label it as a signal — bash uses 128 to
+        # flag a control-flow error, so signal vocabulary would mislead.
+        note: str = _interpret_signal_exit(128) or ""
+        assert "SIGKILL" not in note
+        assert "SIGTERM" not in note
+        assert "SIGSEGV" not in note
+        assert "terminated by signal" not in note.lower()
+
+    def test_exit_128_via_interpret_exit_code(self):
+        # End-to-end: the function the executor actually calls returns a
+        # note for rc=128 so it lands in ``result_dict["exit_code_meaning"]``.
+        note = _interpret_exit_code("set -e; false", 128)
+        assert note is not None
+        assert "128" in note
+
+    def test_exit_129_still_silent_when_signum_uncurated(self):
+        # Edge: 128+1 == 129. Signum 1 (SIGHUP) is not in the curated table
+        # and is too ambiguous to label — the pre-existing rule that
+        # uncurated 128+N stays silent must keep applying. This guards
+        # against the fix accidentally over-firing.
+        assert _interpret_signal_exit(129) is None
+
+    def test_normal_codes_under_128_unchanged(self):
+        # Belt-and-suspenders: the fix only touches the >= 128 branch.
+        # Codes 0, 1, 2, 42, 100, 127 must still return None.
+        for code in (0, 1, 2, 42, 100, 127):
+            assert _interpret_signal_exit(code) is None, f"{code} regressed"
+
+    def test_no_signal_for_raw_128(self):
+        # Regression guard: the note for 128 must not mention a signal
+        # number — signum 0 is not a signal, so mentioning "signal 0" or
+        # "SIGUSR0" or anything signal-shaped would be wrong.
+        note = _interpret_signal_exit(128)
+        assert note is not None
+        # The note should describe bash/control-flow, not a signal.
+        assert "shell" in note.lower() or "command" in note.lower()
