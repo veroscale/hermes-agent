@@ -8118,6 +8118,55 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# Live ``Popen`` handles for workers spawned by this process, keyed by pid.
+#
+# Owning the handle is what makes exit-status capture reliable. If we let the
+# handle be garbage collected, ``Popen.__del__`` parks the un-waited instance
+# in CPython's module-global ``subprocess._active``, and the very next
+# ``Popen(...)`` in this process calls ``subprocess._cleanup()``, which reaps
+# it through ``_internal_poll(_deadstate=sys.maxsize)`` and DISCARDS the
+# status. ``_classify_worker_exit`` then answers ``unknown`` and
+# ``detect_crashed_workers`` records a worker that actually finished (rc=0,
+# ``kanban_complete`` called) as a crash: ``pid NNNN not alive``. The macOS
+# ``_pid_alive`` probe itself spawns ``ps`` via ``Popen``, so the liveness
+# check races the classifier it feeds — the bug fires constantly on a busy
+# board rather than rarely.
+#
+# Entries are removed on reap. Bounded by the same size cap as the exit
+# registry so a lost handle can never grow this without limit.
+_WORKER_HANDLES_MAX = 4096
+_worker_handles: "dict[int, Any]" = {}
+
+
+def _register_worker_handle(proc: Any) -> None:
+    """Retain a spawned worker's ``Popen`` handle so we own its reap.
+
+    Called by ``_default_spawn`` right after ``Popen(...)``. Paired with
+    ``reap_worker_zombies``, which polls these handles (capturing the real
+    exit status via ``_record_worker_exit``) and drops them.
+    """
+    try:
+        pid = int(getattr(proc, "pid", 0) or 0)
+    except Exception:
+        return
+    if pid <= 0:
+        return
+    _worker_handles[pid] = proc
+    if len(_worker_handles) > _WORKER_HANDLES_MAX:
+        # Defensive only: a handle should always be dropped on reap. Evict
+        # already-exited handles first, then the oldest insertions.
+        for _pid, _proc in list(_worker_handles.items()):
+            try:
+                if _proc.poll() is not None:
+                    _worker_handles.pop(_pid, None)
+            except Exception:
+                _worker_handles.pop(_pid, None)
+        while len(_worker_handles) > _WORKER_HANDLES_MAX:
+            try:
+                _worker_handles.pop(next(iter(_worker_handles)))
+            except StopIteration:
+                break
+
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
@@ -8168,6 +8217,22 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
+        # Not in the registry yet. If we still own the handle, the child may
+        # have exited in the window BETWEEN this tick's reap sweep and the
+        # liveness check that led here — poll it now rather than degrading to
+        # ``unknown`` (which books a finished worker as a crash).
+        proc = _worker_handles.get(int(pid))
+        if proc is not None:
+            try:
+                rc = proc.poll()
+            except Exception:
+                rc = None
+            if rc is not None:
+                raw = (-rc & 0x7F) if rc < 0 else ((rc & 0xFF) << 8)
+                _record_worker_exit(int(pid), raw)
+                _worker_handles.pop(int(pid), None)
+                entry = _recent_worker_exits.get(int(pid))
+    if entry is None:
         return ("unknown", None)
     raw, _ = entry
     try:
@@ -8190,21 +8255,52 @@ def reap_worker_zombies() -> "list[int]":
 
     Returns the list of reaped PIDs. Safe to call when there are no
     children (returns []). No-op on Windows.
+
+    Owned handles first (#t_199766f0): every worker spawned by
+    ``_default_spawn`` is registered in ``_worker_handles``. Polling those
+    handles here is what makes exit-status capture DETERMINISTIC — an
+    abandoned ``Popen`` is otherwise reaped by CPython's
+    ``subprocess._cleanup()`` on the next ``Popen(...)`` call in this
+    process (including the ``ps`` probe inside ``_pid_alive``), which
+    discards the status and makes ``_classify_worker_exit`` return
+    ``unknown`` — surfacing a SUCCESSFUL worker as ``pid NNNN not alive``.
+    The bare ``waitpid`` loop below is retained as the fallback for
+    children we do not own (or handles lost across a restart).
     """
     reaped: "list[int]" = []
-    if os.name != "nt":
+    if os.name == "nt":
+        return reaped
+    # 1) Poll handles we own. Popen.poll() routes through
+    #    _handle_exitstatus, so returncode carries the real exit info.
+    for pid, proc in list(_worker_handles.items()):
         try:
-            while True:
-                try:
-                    pid, status = os.waitpid(-1, os.WNOHANG)
-                except ChildProcessError:
-                    break
-                if pid == 0:
-                    break
-                _record_worker_exit(pid, status)
-                reaped.append(pid)
+            rc = proc.poll()
         except Exception:
-            pass
+            _worker_handles.pop(pid, None)
+            continue
+        if rc is None:
+            continue  # still running
+        # Re-encode the returncode into a raw wait status so
+        # _classify_worker_exit's os.WIFEXITED / os.WIFSIGNALED logic
+        # keeps working unchanged: negative rc == killed by -rc.
+        raw = (-rc & 0x7F) if rc < 0 else ((rc & 0xFF) << 8)
+        _record_worker_exit(pid, raw)
+        _worker_handles.pop(pid, None)
+        reaped.append(pid)
+    # 2) Fallback: reap any other children (not owned / handle lost).
+    try:
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if pid == 0:
+                break
+            _record_worker_exit(pid, status)
+            _worker_handles.pop(pid, None)
+            reaped.append(pid)
+    except Exception:
+        pass
     return reaped
 
 
@@ -10744,12 +10840,21 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 # card is small doesn't need (or want) 60+ turns of rope to loop in, while a
 # genuinely long-horizon card outgrows a uniform cap. The default (flag OFF)
 # leaves the budget exactly as before — no behavior change.
+#
+# Calibrated against the ops-board census (task t_199766f0). The flat 60-turn
+# cap was the single largest failure source: 689 ``Iteration budget exhausted
+# (60/60)`` runs, 68 of them in the last 24h before ``agent.max_turns`` was
+# raised 60 -> 200, after which budget exhaustion fell to 1 run. Body length
+# tracks the need monotonically — average body_len was ~3175 chars for
+# timed_out runs vs ~1517 for completed ones — so the tiers are set ABOVE the
+# level at which each bucket was observed to starve, not below it. Under 200
+# in every tier, so the tier still bounds a spinning cheap model.
 DEFAULT_BUDGET_TIER_TURNS = 60
 BUDGET_TIER_SMALL_MAX_CHARS = 800
 BUDGET_TIER_MEDIUM_MAX_CHARS = 2000
-BUDGET_TIER_SMALL_TURNS = 25
-BUDGET_TIER_MEDIUM_TURNS = 50
-BUDGET_TIER_LARGE_TURNS = 80
+BUDGET_TIER_SMALL_TURNS = 60
+BUDGET_TIER_MEDIUM_TURNS = 110
+BUDGET_TIER_LARGE_TURNS = 170
 
 
 def resolve_tiered_turn_budget(
@@ -10773,14 +10878,15 @@ def resolve_tiered_turn_budget(
     the card's declared scope).
 
     Tier mapping (body char length, inclusive):
-      * ``<= small_max`` (800): ``small_turns`` (25) — small cards. Enough
-        to finish honest work; too small to let a token optimizer / cheap
-        worker spin for 60 turns on a task that should take ~10.
-      * ``<= medium_max`` (2000): ``medium_turns`` (50).
-      * else: ``large_turns`` (80) — the counterintuitive tail where our
-        data shows bigger cards time out more (avg body_len of timed_out
-        ≈ 2186 vs ≈ 1551 for completed), precisely because 60 is too tight
-        for them.
+      * ``<= small_max`` (800): ``small_turns`` (60) — small cards. Enough
+        to finish honest work (the small bucket completes at the highest
+        rate of any bucket once the flat cap is lifted); still tight enough
+        that a spinning cheap worker is cut off well before 200.
+      * ``<= medium_max`` (2000): ``medium_turns`` (110).
+      * else: ``large_turns`` (170) — the tail where our data shows bigger
+        cards time out most (avg body_len of timed_out ≈ 3175 vs ≈ 1517 for
+        completed), precisely because a uniform 60 was far too tight. Kept
+        under the profile default (200) so the tier remains a real bound.
 
     The feature-flag read is deliberately lazy (read via load_config_readonly
     on first call) and defensive: any config/import failure disables the
@@ -11026,6 +11132,20 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    #
+    # Retain the Popen handle so we own the reap. Abandoning it hands the
+    # child to CPython's ``subprocess._active`` / ``_cleanup()`` machinery:
+    # ``Popen.__del__`` appends the un-waited instance to ``_active``, and
+    # the NEXT ``Popen(...)`` anywhere in this process calls ``_cleanup()``,
+    # which reaps it via ``_internal_poll(_deadstate=sys.maxsize)`` —
+    # WITHOUT ever passing through ``_record_worker_exit``. The status is
+    # then permanently lost, so ``_classify_worker_exit`` returns
+    # ``("unknown", None)`` and ``detect_crashed_workers`` books a
+    # successful worker as ``pid NNNN not alive``. That path is trivially
+    # reachable because ``_pid_alive`` itself shells out to ``ps`` (a
+    # ``Popen``) on macOS, i.e. the liveness probe races the classifier it
+    # feeds. Owning the handle makes the reap deterministic.
+    _register_worker_handle(proc)
     return proc.pid
 
 

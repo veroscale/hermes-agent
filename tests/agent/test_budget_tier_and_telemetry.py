@@ -57,37 +57,52 @@ def test_tier_default_flag_off_returns_none():
 
 def test_tier_small_body(conn):
     task = _Task(body="x" * 799)
-    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == 25
+    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == kb.BUDGET_TIER_SMALL_TURNS
 
 
 def test_tier_small_boundary_inclusive(conn):
     task = _Task(body="x" * 800)
-    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == 25
+    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == kb.BUDGET_TIER_SMALL_TURNS
 
 
 def test_tier_medium_body(conn):
     task = _Task(body="x" * 801)
-    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == 50
+    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == kb.BUDGET_TIER_MEDIUM_TURNS
 
 
 def test_tier_medium_boundary_inclusive(conn):
     task = _Task(body="x" * 2000)
-    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == 50
+    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == kb.BUDGET_TIER_MEDIUM_TURNS
 
 
 def test_tier_large_body(conn):
     task = _Task(body="x" * 2001)
-    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == 80
+    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == kb.BUDGET_TIER_LARGE_TURNS
 
 
 def test_tier_large_huge_body(conn):
     task = _Task(body="y" * 10000)
-    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == 80
+    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == kb.BUDGET_TIER_LARGE_TURNS
 
 
 def test_tier_blank_body_is_small(conn):
     task = _Task(body="")
-    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == 25
+    assert kb.resolve_tiered_turn_budget(task, flag_on=True) == kb.BUDGET_TIER_SMALL_TURNS
+
+
+def test_tier_ordering_is_monotonic_and_bounded(conn):
+    """Bigger card => never a smaller budget, and every tier stays a real bound.
+
+    Guards the calibration itself: a tier at or above the profile default
+    (agent.max_turns) would silently stop bounding a spinning worker, and a
+    non-monotonic tier would starve exactly the bucket that needs most rope.
+    """
+    assert (
+        kb.BUDGET_TIER_SMALL_TURNS
+        <= kb.BUDGET_TIER_MEDIUM_TURNS
+        <= kb.BUDGET_TIER_LARGE_TURNS
+    )
+    assert kb.BUDGET_TIER_LARGE_TURNS < 200
 
 
 # ---------------------------------------------------------------------------
