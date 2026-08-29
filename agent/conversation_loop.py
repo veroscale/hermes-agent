@@ -4337,6 +4337,25 @@ def run_conversation(
                             # state.db UPDATE here stalled the tool loop for
                             # up to hundreds of ms per API call). Drained at
                             # turn finalize via _persist_session.
+                            #
+                            # Kanban-task attribution: when this process is a
+                            # dispatcher-spawned worker, tag the per-call
+                            # delta with ``kanban:<task_id>`` so analytics
+                            # can attribute main-loop token spend to the
+                            # originating card. The dispatcher sets
+                            # ``HERMES_KANBAN_TASK`` in the spawned env; any
+                            # value here lands in ``session_model_usage.task``
+                            # and participates in the row's PRIMARY KEY.
+                            # Non-kanban callers (CLI, gateway, cron) leave
+                            # ``task`` empty and continue to bucket under
+                            # ``task=''`` exactly as before — restoring the
+                            # attribution that silently went missing for
+                            # 19 days between 2026-08-11 and 2026-08-30
+                            # (t_fd685705).
+                            _kanban_task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+                            _usage_task = (
+                                f"kanban:{_kanban_task}" if _kanban_task else ""
+                            )
                             agent._session_db.queue_token_counts(
                                 agent.session_id,
                                 input_tokens=canonical_usage.input_tokens,
@@ -4353,6 +4372,7 @@ def run_conversation(
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
                                 api_call_count=1,
+                                task=_usage_task,
                             )
                         except Exception as e:
                             # Log token persistence failures so they're
