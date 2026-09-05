@@ -2533,7 +2533,11 @@ def _interpret_signal_exit(exit_code: int) -> str | None:
     Returns None when ``exit_code`` does not look like a signal death.
     Negative codes are Python ``subprocess`` semantics (definite); codes in
     the 128+signum band are the shell convention (very likely but not
-    guaranteed, so those notes hedge with "usually").
+    guaranteed, so those notes hedge with "usually"). The exact value 128
+    (signum 0 in the shell band) is also surfaced as a hedged note because
+    bash uses it for "command failed before running" (e.g. ``set -e``
+    aborts, failed redirection, builtin error) and the bare ``exit 128``
+    leaves the [frx] observer with nothing — see kanban t_0cea7247.
     """
     if exit_code < 0:
         signum = -exit_code
@@ -2549,8 +2553,20 @@ def _interpret_signal_exit(exit_code: int) -> str | None:
             name = f"signal {signum}"
         return f"Command terminated by {name} (signal {signum})"
 
-    if exit_code > 128:
+    if exit_code >= 128:
         signum = exit_code - 128
+        if signum == 0:
+            # 128+N with N=0: bash convention for "the command itself
+            # failed before/during execution" (set -e abort, bad
+            # redirection, builtin error). Not a signal death — bash uses
+            # 128 to flag a control-flow error so callers can distinguish
+            # it from a program's own exit 1. Hedged because programs can
+            # legitimately ``exit 128`` themselves.
+            return (
+                "Exit code 128 usually means the shell could not execute "
+                "the command (bad redirection, set -e abort, builtin "
+                "error, or the command itself exited 128)"
+            )
         note = _SIGNAL_EXIT_NOTES.get(signum)
         if note:
             return (
