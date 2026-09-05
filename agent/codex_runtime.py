@@ -136,6 +136,15 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 # Enqueued for the SessionDB background writer — keeps the
                 # per-call accounting write off the turn thread (see
                 # conversation_loop's queue_token_counts call).
+                #
+                # Kanban-task attribution: same pattern as conversation_loop —
+                # a kanban worker's per-call delta must carry the task id so
+                # analytics can attribute main-loop spend. HERMES_KANBAN_TASK
+                # is set by the dispatcher on every worker spawn.
+                _kanban_task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+                _usage_task = (
+                    f"kanban:{_kanban_task}" if _kanban_task else ""
+                )
                 agent._session_db.queue_token_counts(
                     agent.session_id,
                     model=agent.model,
@@ -143,6 +152,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                     billing_base_url=agent.base_url,
                     billing_mode="subscription_included",
                     api_call_count=1,
+                    task=_usage_task,
                 )
             except Exception as exc:
                 logger.debug(
@@ -217,6 +227,16 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             if not agent._session_db_created:
                 agent._ensure_db_session()
             # Enqueued for the SessionDB background writer (see above).
+            #
+            # Kanban-task attribution: same pattern as conversation_loop —
+            # see the matching comment above and t_fd685705 for the 19-day
+            # silent gap this restores. HERMES_KANBAN_TASK is set by the
+            # dispatcher on every worker spawn; non-kanban callers leave
+            # ``task`` empty and continue to bucket under ``task=''``.
+            _kanban_task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+            _usage_task = (
+                f"kanban:{_kanban_task}" if _kanban_task else ""
+            )
             agent._session_db.queue_token_counts(
                 agent.session_id,
                 input_tokens=canonical_usage.input_tokens,
@@ -234,6 +254,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 if cost_result.status == "included" else None,
                 model=agent.model,
                 api_call_count=1,
+                task=_usage_task,
             )
         except Exception as exc:
             logger.debug(

@@ -2763,6 +2763,16 @@ DEFAULT_CONFIG = {
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
         "review_dispatch": True,
+        # Per-card turn-budget tiers (feature flag). When ON, the dispatcher
+        # derives each worker's `--max-turns` from the card's body length:
+        # small bodies (<=800 chars) → 25 turns, medium (<=2000) → 50,
+        # large → 80. This targets the observed failure mode where cheap
+        # workers loop without converging on small cards (25 is enough) while
+        # genuinely long-horizon cards time out at a uniform 60 (they get 80).
+        # Off (default) = no behavior change; workers use the profile's
+        # configured `agent.max_turns`. Thresholds live in
+        # `hermes_cli.kanban_db.resolve_tiered_turn_budget`.
+        "tiered_turn_budget": False,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

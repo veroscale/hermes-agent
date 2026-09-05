@@ -124,3 +124,90 @@ def disable_lazy_stt_install():
     """
     with patch("tools.transcription_tools._try_lazy_install_stt", return_value=False):
         yield
+
+
+# Session-context markers that change approval / cron / gateway behavior.
+# Tests under tests/tools/ assert specific marker states; if any of these
+# is set in the parent process (developer shell, kanban worker, cron),
+# pytest inherits it via os.environ and the approval gates
+# (check_dangerous_command / check_execute_code_guard) silently take the
+# wrong branch. 31 approval tests fail when pytest is launched from inside
+# a ``hermes chat -q`` worker because HERMES_SINGLE_QUERY_SESSION leaks
+# through. Clearing these markers here gives every test a clean baseline;
+# tests that want a marker set it explicitly via ``monkeypatch.setenv``
+# in their own body, which runs after this fixture.
+_HERMES_SESSION_MARKERS = (
+    "HERMES_SINGLE_QUERY_SESSION",
+    "HERMES_CRON_SESSION",
+    "HERMES_GATEWAY_SESSION",
+    "HERMES_EXEC_ASK",
+    "HERMES_YOLO_MODE",
+    "HERMES_INTERACTIVE",
+    "HERMES_SESSION_PLATFORM",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_ambient_hermes_session_markers(monkeypatch):
+    """Strip ambient HERMES_* session markers inherited from the launcher.
+
+    A developer shell, a ``hermes chat -q`` kanban worker, or a cron tick
+    can each export one or more of the markers in :data:`_HERMES_SESSION_MARKERS`
+    before pytest ever runs.  Once pytest inherits them, every approval-gate
+    test under tests/tools/ silently takes the wrong branch — the single-query
+    branch short-circuits ahead of the cron branch, the gateway branch wins
+    over a headless CLI test, and ``_YOLO_MODE_FROZEN`` is whatever the
+    parent process had at import time.  31 tests in
+    test_execute_code_approval_cluster / test_cron_approval_mode /
+    test_approval_mode_parity / test_approval_outcome_parity /
+    test_approval_config_readonly / test_code_execution_modes fail
+    identically on untouched main when launched from a worker (they all
+    pass under ``env -u HERMES_SINGLE_QUERY_SESSION``).
+
+    This fixture only clears ambient inheritance.  Tests that *want* a
+    marker — most of the suite already do via ``monkeypatch.setenv`` — set
+    it explicitly in their own body after this fixture runs, so coverage is
+    preserved.
+
+    Two layers need clearing, not one:
+
+    1. ``os.environ``: most markers read straight off ``os.getenv`` via
+       ``env_var_enabled`` / ``is_truthy_value``.  ``monkeypatch.delenv``
+       removes them for the duration of this test and restores them on
+       teardown.
+
+    2. ``gateway.session_context`` ContextVars: ``_VAR_MAP`` covers
+       ``HERMES_CRON_SESSION`` and ``HERMES_SESSION_PLATFORM``, and
+       ``get_session_env`` prefers the ContextVar over ``os.environ`` if it
+       is set (even to ``""``).  Calling ``reset_session_vars()`` here puts
+       every mapped ContextVar back to ``_UNSET`` so the env fallback
+       (now cleared in step 1) is what production code reads.
+
+    ``_YOLO_MODE_FROZEN`` is module-import-time state (``tools/approval.py``
+    snapshots ``os.getenv("HERMES_YOLO_MODE")`` at first import).  The env
+    clear above prevents new subprocesses from seeing it, but the module
+    constant still reflects the parent's value.  Patch it to ``False`` to
+    match the post-clear env state — tests that want YOLO on set it via
+    ``monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)``
+    themselves, exactly as they already do.
+    """
+    for marker in _HERMES_SESSION_MARKERS:
+        monkeypatch.delenv(marker, raising=False)
+
+    try:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+    except Exception:
+        # gateway may not be importable in a stripped-down test environment.
+        # The env clear above is still effective for the env-only markers.
+        pass
+
+    try:
+        import tools.approval as _approval_mod
+
+        monkeypatch.setattr(_approval_mod, "_YOLO_MODE_FROZEN", False)
+    except Exception:
+        pass
+
+    yield

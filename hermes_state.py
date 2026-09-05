@@ -8607,7 +8607,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # two deltas to merge: model/billing_* feed COALESCE backfill and the
     # per-model usage attribution key, and cost_status/cost_source are
     # last-non-None-wins — equality makes the merged UPDATE byte-for-byte
-    # equivalent to applying the deltas sequentially.
+    # equivalent to applying the deltas sequentially. ``task`` joins the
+    # route key so a kanban worker's per-call delta (task="kanban:t_xxx")
+    # never coalesces with the empty-task main-loop delta of an unrelated
+    # caller writing the same session in the same batch — see
+    # tests/state/test_session_model_usage_kanban_attribution.py.
     _TOKEN_DELTA_SUM_FIELDS = (
         "input_tokens", "output_tokens", "cache_read_tokens",
         "cache_write_tokens", "reasoning_tokens", "api_call_count",
@@ -8615,7 +8619,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
     _TOKEN_DELTA_ROUTE_FIELDS = (
         "model", "cost_status", "cost_source", "pricing_version",
-        "billing_provider", "billing_base_url", "billing_mode",
+        "billing_provider", "billing_base_url", "billing_mode", "task",
     )
 
     def queue_token_counts(self, session_id: str, **kwargs) -> None:
@@ -8885,6 +8889,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
+        task: str = "",
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -8894,6 +8899,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         When *absolute* is True, values are **set directly** — use this when
         the caller already holds cumulative totals (gateway path, where the
         cached agent accumulates across messages).
+
+        ``task`` (default ``""``) is the kanban-task attribution forwarded
+        into ``session_model_usage.task`` for the per-model write. Kanban
+        workers pass ``f"kanban:{HERMES_KANBAN_TASK}"`` so token spend can
+        be bucketed by task in analytics. Aux calls already use
+        ``record_auxiliary_usage(task=...)`` for their non-empty task names
+        (vision, compression, title_generation, background_review); this
+        parameter extends the same key to main-loop turn calls. Empty
+        ``task`` preserves the legacy behavior — every non-kanban caller
+        continues to land in the ``task=''`` row that analytics already
+        group by.
         """
         # Ensure the session row exists so the UPDATE doesn't silently affect
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
@@ -9032,6 +9048,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     cost_status=cost_status,
                     cost_source=cost_source,
                     api_call_count=api_call_count,
+                    task=task,
                 )
         self._execute_write(_do)
 
